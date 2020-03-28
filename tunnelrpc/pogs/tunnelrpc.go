@@ -47,6 +47,7 @@ type SuccessfulTunnelRegistration struct {
 	LogLines    []string
 	TunnelID    string `capnp:"tunnelID"`
 	EventDigest []byte
+	ConnDigest  []byte
 }
 
 func NewSuccessfulTunnelRegistration(
@@ -54,6 +55,7 @@ func NewSuccessfulTunnelRegistration(
 	logLines []string,
 	tunnelID string,
 	eventDigest []byte,
+	connDigest []byte,
 ) *TunnelRegistration {
 	// Marshal nil will result in an error
 	if logLines == nil {
@@ -65,6 +67,7 @@ func NewSuccessfulTunnelRegistration(
 			LogLines:    logLines,
 			TunnelID:    tunnelID,
 			EventDigest: eventDigest,
+			ConnDigest:  connDigest,
 		},
 	}
 }
@@ -168,6 +171,7 @@ type RegistrationOptions struct {
 	CompressionQuality   uint64 `capnp:"compressionQuality"`
 	UUID                 string `capnp:"uuid"`
 	NumPreviousAttempts  uint8
+	Features             []string
 }
 
 func MarshalRegistrationOptions(s tunnelrpc.RegistrationOptions, p *RegistrationOptions) error {
@@ -433,7 +437,7 @@ type TunnelServer interface {
 	UnregisterTunnel(ctx context.Context, gracePeriodNanoSec int64) error
 	Connect(ctx context.Context, parameters *ConnectParameters) (ConnectResult, error)
 	Authenticate(ctx context.Context, originCert []byte, hostname string, options *RegistrationOptions) (*AuthenticateResponse, error)
-	ReconnectTunnel(ctx context.Context, jwt, eventDigest []byte, hostname string, options *RegistrationOptions) (*TunnelRegistration, error)
+	ReconnectTunnel(ctx context.Context, jwt, eventDigest, connDigest []byte, hostname string, options *RegistrationOptions) (*TunnelRegistration, error)
 }
 
 func TunnelServer_ServerToClient(s TunnelServer) tunnelrpc.TunnelServer {

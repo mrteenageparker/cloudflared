@@ -20,6 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/cloudflare/cloudflared/buffer"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/buildinfo"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/h2mux"
@@ -84,6 +85,8 @@ type TunnelConfig struct {
 
 	// feature-flag to use new edge reconnect tokens
 	UseReconnectToken bool
+	// feature-flag for using ConnectionDigest
+	UseQuickReconnects bool
 }
 
 // ReconnectTunnelCredentialManager is invoked by functions in this file to
@@ -92,6 +95,8 @@ type ReconnectTunnelCredentialManager interface {
 	ReconnectToken() ([]byte, error)
 	EventDigest() ([]byte, error)
 	SetEventDigest(eventDigest []byte)
+	ConnDigest(connID uint8) ([]byte, error)
+	SetConnDigest(connID uint8, connDigest []byte)
 }
 
 type dupConnRegisterTunnelError struct{}
@@ -160,15 +165,16 @@ func (c *TunnelConfig) RegistrationOptions(connectionID uint8, OriginLocalIP str
 		RunFromTerminal:      c.RunFromTerminal,
 		CompressionQuality:   c.CompressionQuality,
 		UUID:                 uuid.String(),
+		Features:             connection.SupportedFeatures,
 	}
 }
 
-func StartTunnelDaemon(ctx context.Context, config *TunnelConfig, connectedSignal *signal.Signal, cloudflaredID uuid.UUID) error {
+func StartTunnelDaemon(ctx context.Context, config *TunnelConfig, connectedSignal *signal.Signal, cloudflaredID uuid.UUID, reconnectCh chan struct{}) error {
 	s, err := NewSupervisor(config, cloudflaredID)
 	if err != nil {
 		return err
 	}
-	return s.Run(ctx, connectedSignal)
+	return s.Run(ctx, connectedSignal, reconnectCh)
 }
 
 func ServeTunnelLoop(ctx context.Context,
@@ -178,6 +184,8 @@ func ServeTunnelLoop(ctx context.Context,
 	connectionID uint8,
 	connectedSignal *signal.Signal,
 	u uuid.UUID,
+	bufferPool *buffer.Pool,
+	reconnectCh chan struct{},
 ) error {
 	connectionLogger := config.Logger.WithField("connectionID", connectionID)
 	config.Metrics.incrementHaConnections()
@@ -201,6 +209,8 @@ func ServeTunnelLoop(ctx context.Context,
 			connectedFuse,
 			&backoff,
 			u,
+			bufferPool,
+			reconnectCh,
 		)
 		if recoverable {
 			if duration, ok := backoff.GetBackoffDuration(ctx); ok {
@@ -223,6 +233,8 @@ func ServeTunnel(
 	connectedFuse *h2mux.BooleanFuse,
 	backoff *BackoffHandler,
 	u uuid.UUID,
+	bufferPool *buffer.Pool,
+	reconnectCh chan struct{},
 ) (err error, recoverable bool) {
 	// Treat panics as recoverable errors
 	defer func() {
@@ -243,7 +255,7 @@ func ServeTunnel(
 	tags["ha"] = connectionTag
 
 	// Returns error from parsing the origin URL or handshake errors
-	handler, originLocalIP, err := NewTunnelHandler(ctx, config, addr, connectionID)
+	handler, originLocalIP, err := NewTunnelHandler(ctx, config, addr, connectionID, bufferPool)
 	if err != nil {
 		errLog := logger.WithError(err)
 		switch err.(type) {
@@ -273,7 +285,15 @@ func ServeTunnel(
 			eventDigest, eventDigestErr := credentialManager.EventDigest()
 			// if we have both credentials, we can reconnect
 			if tokenErr == nil && eventDigestErr == nil {
-				return ReconnectTunnel(serveCtx, token, eventDigest, handler.muxer, config, logger, connectionID, originLocalIP, u)
+				var connDigest []byte
+
+				// check if we can use Quick Reconnects
+				if config.UseQuickReconnects {
+					if digest, connDigestErr := credentialManager.ConnDigest(connectionID); connDigestErr == nil {
+						connDigest = digest
+					}
+				}
+				return ReconnectTunnel(serveCtx, token, eventDigest, connDigest, handler.muxer, config, logger, connectionID, originLocalIP, u, credentialManager)
 			}
 			// log errors and proceed to RegisterTunnel
 			if tokenErr != nil {
@@ -299,6 +319,16 @@ func ServeTunnel(
 				handler.UpdateMetrics(connectionTag)
 			}
 		}
+	})
+
+	errGroup.Go(func() error {
+		select {
+		case <-reconnectCh:
+			return fmt.Errorf("received disconnect signal")
+		case <-serveCtx.Done():
+			return nil
+		}
+
 	})
 
 	errGroup.Go(func() error {
@@ -375,19 +405,20 @@ func RegisterTunnel(
 		return processRegisterTunnelError(registrationErr, config.Metrics, register)
 	}
 	credentialManager.SetEventDigest(registration.EventDigest)
-	return processRegistrationSuccess(config, logger, connectionID, registration, register)
+	return processRegistrationSuccess(config, logger, connectionID, registration, register, credentialManager)
 }
 
 func ReconnectTunnel(
 	ctx context.Context,
 	token []byte,
-	eventDigest []byte,
+	eventDigest, connDigest []byte,
 	muxer *h2mux.Muxer,
 	config *TunnelConfig,
 	logger *log.Entry,
 	connectionID uint8,
 	originLocalIP string,
 	uuid uuid.UUID,
+	credentialManager ReconnectTunnelCredentialManager,
 ) error {
 	config.TransportLogger.Debug("initiating RPC stream to reconnect")
 	tunnelServer, err := connection.NewRPCClient(ctx, muxer, config.TransportLogger.WithField("subsystem", "rpc-reconnect"), openStreamTimeout)
@@ -405,6 +436,7 @@ func ReconnectTunnel(
 		ctx,
 		token,
 		eventDigest,
+		connDigest,
 		config.Hostname,
 		config.RegistrationOptions(connectionID, originLocalIP, uuid),
 	)
@@ -412,10 +444,17 @@ func ReconnectTunnel(
 		// ReconnectTunnel RPC failure
 		return processRegisterTunnelError(registrationErr, config.Metrics, reconnect)
 	}
-	return processRegistrationSuccess(config, logger, connectionID, registration, reconnect)
+	return processRegistrationSuccess(config, logger, connectionID, registration, reconnect, credentialManager)
 }
 
-func processRegistrationSuccess(config *TunnelConfig, logger *log.Entry, connectionID uint8, registration *tunnelpogs.TunnelRegistration, name registerRPCName) error {
+func processRegistrationSuccess(
+	config *TunnelConfig,
+	logger *log.Entry,
+	connectionID uint8,
+	registration *tunnelpogs.TunnelRegistration,
+	name registerRPCName,
+	credentialManager ReconnectTunnelCredentialManager,
+) error {
 	for _, logLine := range registration.LogLines {
 		logger.Info(logLine)
 	}
@@ -437,6 +476,7 @@ func processRegistrationSuccess(config *TunnelConfig, logger *log.Entry, connect
 		}
 	}
 
+	credentialManager.SetConnDigest(connectionID, registration.ConnDigest)
 	config.Metrics.userHostnamesCounts.WithLabelValues(registration.Url).Inc()
 
 	logger.Infof("Route propagating, it may take up to 1 minute for your new route to become functional")
@@ -500,6 +540,8 @@ type TunnelHandler struct {
 	connectionID      string
 	logger            *log.Logger
 	noChunkedEncoding bool
+
+	bufferPool *buffer.Pool
 }
 
 // NewTunnelHandler returns a TunnelHandler, origin LAN IP and error
@@ -507,6 +549,7 @@ func NewTunnelHandler(ctx context.Context,
 	config *TunnelConfig,
 	addr *net.TCPAddr,
 	connectionID uint8,
+	bufferPool *buffer.Pool,
 ) (*TunnelHandler, string, error) {
 	originURL, err := validation.ValidateUrl(config.OriginUrl)
 	if err != nil {
@@ -522,6 +565,7 @@ func NewTunnelHandler(ctx context.Context,
 		connectionID:      uint8ToString(connectionID),
 		logger:            config.Logger,
 		noChunkedEncoding: config.NoChunkedEncoding,
+		bufferPool:        bufferPool,
 	}
 	if h.httpClient == nil {
 		h.httpClient = http.DefaultTransport
@@ -580,7 +624,7 @@ func (h *TunnelHandler) createRequest(stream *h2mux.MuxedStream) (*http.Request,
 	if err != nil {
 		return nil, errors.Wrap(err, "Unexpected error from http.NewRequest")
 	}
-	err = h2mux.OldH2RequestHeadersToH1Request(stream.Headers, req)
+	err = h2mux.H2RequestHeadersToH1Request(stream.Headers, req)
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid request received")
 	}
@@ -599,7 +643,7 @@ func (h *TunnelHandler) serveWebsocket(stream *h2mux.MuxedStream, req *http.Requ
 		return nil, err
 	}
 	defer conn.Close()
-	err = stream.WriteHeaders(h2mux.OldH1ResponseToH2ResponseHeaders(response))
+	err = stream.WriteHeaders(h2mux.H1ResponseToH2ResponseHeaders(response))
 	if err != nil {
 		return nil, errors.Wrap(err, "Error writing response header")
 	}
@@ -633,7 +677,7 @@ func (h *TunnelHandler) serveHTTP(stream *h2mux.MuxedStream, req *http.Request) 
 	}
 	defer response.Body.Close()
 
-	err = stream.WriteHeaders(h2mux.OldH1ResponseToH2ResponseHeaders(response))
+	err = stream.WriteHeaders(h2mux.H1ResponseToH2ResponseHeaders(response))
 	if err != nil {
 		return nil, errors.Wrap(err, "Error writing response header")
 	}
@@ -642,7 +686,9 @@ func (h *TunnelHandler) serveHTTP(stream *h2mux.MuxedStream, req *http.Request) 
 	} else {
 		// Use CopyBuffer, because Copy only allocates a 32KiB buffer, and cross-stream
 		// compression generates dictionary on first write
-		io.CopyBuffer(stream, response.Body, make([]byte, 512*1024))
+		buf := h.bufferPool.Get()
+		defer h.bufferPool.Put(buf)
+		io.CopyBuffer(stream, response.Body, buf)
 	}
 	return response, nil
 }

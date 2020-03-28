@@ -237,7 +237,6 @@ func prepareTunnelConfig(
 	err = validation.ValidateHTTPService(originURL, hostname, httpTransport)
 	if err != nil {
 		logger.WithError(err).Error("unable to connect to the origin")
-		return nil, errors.Wrap(err, "unable to connect to the origin")
 	}
 
 	toEdgeTLSConfig, err := tlsconfig.CreateTunnelConfig(c)
@@ -277,6 +276,7 @@ func prepareTunnelConfig(
 		TransportLogger:      transportLogger,
 		UseDeclarativeTunnel: c.Bool("use-declarative-tunnels"),
 		UseReconnectToken:    c.Bool("use-reconnect-token"),
+		UseQuickReconnects:   c.Bool("use-quick-reconnects"),
 	}, nil
 }
 

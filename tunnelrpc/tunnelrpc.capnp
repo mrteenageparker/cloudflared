@@ -23,6 +23,8 @@ struct TunnelRegistration {
     retryAfterSeconds @5 :UInt16;
     # A unique ID used to reconnect this tunnel.
     eventDigest @6 :Data;
+    # A unique ID used to prove this tunnel was previously connected to a given metal.
+    connDigest @7 :Data;
 }
 
 struct RegistrationOptions {
@@ -50,6 +52,8 @@ struct RegistrationOptions {
     uuid @11 :Text;
     # number of previous attempts to send RegisterTunnel/ReconnectTunnel
     numPreviousAttempts @12 :UInt8;
+    # Set of features this cloudflared knows it supports
+    features @13 :List(Text);
 }
 
 struct CapnpConnectParameters {
@@ -293,7 +297,7 @@ interface TunnelServer {
     unregisterTunnel @2 (gracePeriodNanoSec :Int64) -> ();
     connect @3 (parameters :CapnpConnectParameters) -> (result :ConnectResult);
     authenticate @4 (originCert :Data, hostname :Text, options :RegistrationOptions) -> (result :AuthenticateResponse);
-    reconnectTunnel @5 (jwt :Data, eventDigest :Data, hostname :Text, options :RegistrationOptions) -> (result :TunnelRegistration);
+    reconnectTunnel @5 (jwt :Data, eventDigest :Data, connDigest :Data, hostname :Text, options :RegistrationOptions) -> (result :TunnelRegistration);
 }
 
 interface ClientService {

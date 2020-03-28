@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io/ioutil"
@@ -399,10 +400,16 @@ func StartServer(c *cli.Context, version string, shutdownC, graceShutdownC chan 
 		return err
 	}
 
+	reconnectCh := make(chan struct{}, 1)
+	if c.IsSet("stdin-control") {
+		logger.Warn("Enabling control through stdin")
+		go stdinControl(reconnectCh)
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		errC <- origin.StartTunnelDaemon(ctx, tunnelConfig, connectedSignal, cloudflaredID)
+		errC <- origin.StartTunnelDaemon(ctx, tunnelConfig, connectedSignal, cloudflaredID, reconnectCh)
 	}()
 
 	return waitToShutdown(&wg, errC, shutdownC, graceShutdownC, c.Duration("grace-period"))
@@ -596,6 +603,8 @@ func hostnameFromURI(uri string) string {
 		return addPortIfMissing(u, 22)
 	case "rdp":
 		return addPortIfMissing(u, 3389)
+	case "tcp":
+		return addPortIfMissing(u, 7864) // just a random port since there isn't a default in this case
 	}
 	return ""
 }
@@ -980,7 +989,14 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 		altsrc.NewBoolFlag(&cli.BoolFlag{
 			Name:    "use-reconnect-token",
 			Usage:   "Test reestablishing connections with the new 'reconnect token' flow.",
+			Value:   true,
 			EnvVars: []string{"TUNNEL_USE_RECONNECT_TOKEN"},
+			Hidden:  true,
+		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    "use-quick-reconnects",
+			Usage:   "Test reestablishing connections with the new 'connection digest' flow.",
+			EnvVars: []string{"TUNNEL_USE_QUICK_RECONNECTS"},
 			Hidden:  true,
 		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
@@ -1051,5 +1067,28 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			EnvVars: []string{"HOST_KEY_PATH"},
 			Hidden:  true,
 		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    "stdin-control",
+			Usage:   "Control the process using commands sent through stdin",
+			EnvVars: []string{"STDIN-CONTROL"},
+			Hidden:  true,
+			Value:   false,
+		}),
+	}
+}
+
+func stdinControl(reconnectCh chan struct{}) {
+	for {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			command := scanner.Text()
+
+			switch command {
+			case "reconnect":
+				reconnectCh <- struct{}{}
+			default:
+				logger.Warn("Unknown command: ", command)
+			}
+		}
 	}
 }

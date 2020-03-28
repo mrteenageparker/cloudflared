@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/cloudflare/cloudflared/buffer"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/h2mux"
@@ -57,11 +58,16 @@ type Supervisor struct {
 
 	logger *logrus.Entry
 
-	jwtLock *sync.RWMutex
+	jwtLock sync.RWMutex
 	jwt     []byte
 
-	eventDigestLock *sync.RWMutex
+	eventDigestLock sync.RWMutex
 	eventDigest     []byte
+
+	connDigestLock sync.RWMutex
+	connDigest     map[uint8][]byte
+
+	bufferPool *buffer.Pool
 }
 
 type resolveResult struct {
@@ -94,14 +100,14 @@ func NewSupervisor(config *TunnelConfig, u uuid.UUID) (*Supervisor, error) {
 		tunnelErrors:      make(chan tunnelError),
 		tunnelsConnecting: map[int]chan struct{}{},
 		logger:            config.Logger.WithField("subsystem", "supervisor"),
-		jwtLock:           &sync.RWMutex{},
-		eventDigestLock:   &sync.RWMutex{},
+		connDigest:        make(map[uint8][]byte),
+		bufferPool:        buffer.NewPool(512 * 1024),
 	}, nil
 }
 
-func (s *Supervisor) Run(ctx context.Context, connectedSignal *signal.Signal) error {
+func (s *Supervisor) Run(ctx context.Context, connectedSignal *signal.Signal, reconnectCh chan struct{}) error {
 	logger := s.config.Logger
-	if err := s.initialize(ctx, connectedSignal); err != nil {
+	if err := s.initialize(ctx, connectedSignal, reconnectCh); err != nil {
 		return err
 	}
 	var tunnelsWaiting []int
@@ -151,7 +157,7 @@ func (s *Supervisor) Run(ctx context.Context, connectedSignal *signal.Signal) er
 		case <-backoffTimer:
 			backoffTimer = nil
 			for _, index := range tunnelsWaiting {
-				go s.startTunnel(ctx, index, s.newConnectedTunnelSignal(index))
+				go s.startTunnel(ctx, index, s.newConnectedTunnelSignal(index), reconnectCh)
 			}
 			tunnelsActive += len(tunnelsWaiting)
 			tunnelsWaiting = nil
@@ -185,7 +191,7 @@ func (s *Supervisor) Run(ctx context.Context, connectedSignal *signal.Signal) er
 }
 
 // Returns nil if initialization succeeded, else the initialization error.
-func (s *Supervisor) initialize(ctx context.Context, connectedSignal *signal.Signal) error {
+func (s *Supervisor) initialize(ctx context.Context, connectedSignal *signal.Signal, reconnectCh chan struct{}) error {
 	logger := s.logger
 
 	s.lastResolve = time.Now()
@@ -195,7 +201,7 @@ func (s *Supervisor) initialize(ctx context.Context, connectedSignal *signal.Sig
 		s.config.HAConnections = availableAddrs
 	}
 
-	go s.startFirstTunnel(ctx, connectedSignal)
+	go s.startFirstTunnel(ctx, connectedSignal, reconnectCh)
 	select {
 	case <-ctx.Done():
 		<-s.tunnelErrors
@@ -207,7 +213,7 @@ func (s *Supervisor) initialize(ctx context.Context, connectedSignal *signal.Sig
 	// At least one successful connection, so start the rest
 	for i := 1; i < s.config.HAConnections; i++ {
 		ch := signal.New(make(chan struct{}))
-		go s.startTunnel(ctx, i, ch)
+		go s.startTunnel(ctx, i, ch, reconnectCh)
 		time.Sleep(registrationInterval)
 	}
 	return nil
@@ -215,7 +221,7 @@ func (s *Supervisor) initialize(ctx context.Context, connectedSignal *signal.Sig
 
 // startTunnel starts the first tunnel connection. The resulting error will be sent on
 // s.tunnelErrors. It will send a signal via connectedSignal if registration succeed
-func (s *Supervisor) startFirstTunnel(ctx context.Context, connectedSignal *signal.Signal) {
+func (s *Supervisor) startFirstTunnel(ctx context.Context, connectedSignal *signal.Signal, reconnectCh chan struct{}) {
 	var (
 		addr *net.TCPAddr
 		err  error
@@ -230,7 +236,7 @@ func (s *Supervisor) startFirstTunnel(ctx context.Context, connectedSignal *sign
 		return
 	}
 
-	err = ServeTunnelLoop(ctx, s, s.config, addr, thisConnID, connectedSignal, s.cloudflaredUUID)
+	err = ServeTunnelLoop(ctx, s, s.config, addr, thisConnID, connectedSignal, s.cloudflaredUUID, s.bufferPool, reconnectCh)
 	// If the first tunnel disconnects, keep restarting it.
 	edgeErrors := 0
 	for s.unusedIPs() {
@@ -253,13 +259,13 @@ func (s *Supervisor) startFirstTunnel(ctx context.Context, connectedSignal *sign
 				return
 			}
 		}
-		err = ServeTunnelLoop(ctx, s, s.config, addr, thisConnID, connectedSignal, s.cloudflaredUUID)
+		err = ServeTunnelLoop(ctx, s, s.config, addr, thisConnID, connectedSignal, s.cloudflaredUUID, s.bufferPool, reconnectCh)
 	}
 }
 
 // startTunnel starts a new tunnel connection. The resulting error will be sent on
 // s.tunnelErrors.
-func (s *Supervisor) startTunnel(ctx context.Context, index int, connectedSignal *signal.Signal) {
+func (s *Supervisor) startTunnel(ctx context.Context, index int, connectedSignal *signal.Signal, reconnectCh chan struct{}) {
 	var (
 		addr *net.TCPAddr
 		err  error
@@ -272,7 +278,7 @@ func (s *Supervisor) startTunnel(ctx context.Context, index int, connectedSignal
 	if err != nil {
 		return
 	}
-	err = ServeTunnelLoop(ctx, s, s.config, addr, uint8(index), connectedSignal, s.cloudflaredUUID)
+	err = ServeTunnelLoop(ctx, s, s.config, addr, uint8(index), connectedSignal, s.cloudflaredUUID, s.bufferPool, reconnectCh)
 }
 
 func (s *Supervisor) newConnectedTunnelSignal(index int) *signal.Signal {
@@ -326,6 +332,22 @@ func (s *Supervisor) SetEventDigest(eventDigest []byte) {
 	s.eventDigestLock.Lock()
 	defer s.eventDigestLock.Unlock()
 	s.eventDigest = eventDigest
+}
+
+func (s *Supervisor) ConnDigest(connID uint8) ([]byte, error) {
+	s.connDigestLock.RLock()
+	defer s.connDigestLock.RUnlock()
+	digest, ok := s.connDigest[connID]
+	if !ok {
+		return nil, fmt.Errorf("no connection digest for connection %v", connID)
+	}
+	return digest, nil
+}
+
+func (s *Supervisor) SetConnDigest(connID uint8, connDigest []byte) {
+	s.connDigestLock.Lock()
+	defer s.connDigestLock.Unlock()
+	s.connDigest[connID] = connDigest
 }
 
 func (s *Supervisor) refreshAuth(
