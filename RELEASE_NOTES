@@ -1,3 +1,23 @@
+2020.5.0
+- 2020-05-01 TUN-2943: Copy certutil from edge into cloudflared
+- 2020-05-05 TUN-2955: Fix connection and goroutine leaks when tunnel conection is terminated on error. Only unregister tunnels that had connected successfully. Close edge connection used to unregister the tunnel. Use buffered channels for error channels where receiver may quit early on context cancellation.
+- 2020-04-30 TUN-2940: Added delay parameter to stdin reconnect command.
+- 2020-04-27 TUN-2921: Rework address selection logic to avoid corner cases
+- 2020-04-28 TUN-2872: Exit with non-0 status code when the binary is updated so launchd will restart the service
+- 2020-04-13 AUTH-2587 add config watcher and reload logic for access client forwarder
+
+2020.4.0
+- 2020-04-10 TUN-2881: Parameterize response meta information header name in the generating function
+- 2020-04-11 TUN-2894: ResponseMetaHeader should be public
+- 2020-04-09 TUN-2880: Return metadata about source of the response from cloudflared
+- 2020-04-04 ARES-899: Fixes DoH client as system resolver. Fixes #91
+- 2020-03-31 AUTH-2394 added socks5 proxy
+- 2020-02-24 AUTH-2235 GetTokenIfExists now parses JWT payload for json expiry field to detect if the cached access token is expired
+
+2020.3.2
+- 2020-03-31 TUN-2854: Quick Reconnects should be an optional supported feature
+- 2020-03-30 TUN-2850: Tunnel stripping Cloudflare headers
+
 2020.3.1
 - 2020-03-27 TUN-2846: Trigger debug reconnects from stdin commands, not SIGUSR1
 

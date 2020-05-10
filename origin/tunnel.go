@@ -39,6 +39,8 @@ const (
 	lbProbeUserAgentPrefix   = "Mozilla/5.0 (compatible; Cloudflare-Traffic-Manager/1.0; +https://www.cloudflare.com/traffic-manager/;"
 	TagHeaderNamePrefix      = "Cf-Warp-Tag-"
 	DuplicateConnectionError = "EDUPCONN"
+	FeatureSerializedHeaders = "serialized_headers"
+	FeatureQuickReconnects   = "quick_reconnects"
 )
 
 type registerRPCName string
@@ -165,11 +167,19 @@ func (c *TunnelConfig) RegistrationOptions(connectionID uint8, OriginLocalIP str
 		RunFromTerminal:      c.RunFromTerminal,
 		CompressionQuality:   c.CompressionQuality,
 		UUID:                 uuid.String(),
-		Features:             connection.SupportedFeatures,
+		Features:             c.SupportedFeatures(),
 	}
 }
 
-func StartTunnelDaemon(ctx context.Context, config *TunnelConfig, connectedSignal *signal.Signal, cloudflaredID uuid.UUID, reconnectCh chan struct{}) error {
+func (c *TunnelConfig) SupportedFeatures() []string {
+	basic := []string{FeatureSerializedHeaders}
+	if c.UseQuickReconnects {
+		basic = append(basic, FeatureQuickReconnects)
+	}
+	return basic
+}
+
+func StartTunnelDaemon(ctx context.Context, config *TunnelConfig, connectedSignal *signal.Signal, cloudflaredID uuid.UUID, reconnectCh chan ReconnectSignal) error {
 	s, err := NewSupervisor(config, cloudflaredID)
 	if err != nil {
 		return err
@@ -185,7 +195,7 @@ func ServeTunnelLoop(ctx context.Context,
 	connectedSignal *signal.Signal,
 	u uuid.UUID,
 	bufferPool *buffer.Pool,
-	reconnectCh chan struct{},
+	reconnectCh chan ReconnectSignal,
 ) error {
 	connectionLogger := config.Logger.WithField("connectionID", connectionID)
 	config.Metrics.incrementHaConnections()
@@ -234,7 +244,7 @@ func ServeTunnel(
 	backoff *BackoffHandler,
 	u uuid.UUID,
 	bufferPool *buffer.Pool,
-	reconnectCh chan struct{},
+	reconnectCh chan ReconnectSignal,
 ) (err error, recoverable bool) {
 	// Treat panics as recoverable errors
 	defer func() {
@@ -312,7 +322,10 @@ func ServeTunnel(
 			select {
 			case <-serveCtx.Done():
 				// UnregisterTunnel blocks until the RPC call returns
-				err := UnregisterTunnel(handler.muxer, config.GracePeriod, config.TransportLogger)
+				var err error
+				if connectedFuse.Value() {
+					err = UnregisterTunnel(handler.muxer, config.GracePeriod, config.TransportLogger)
+				}
 				handler.muxer.Shutdown()
 				return err
 			case <-updateMetricsTickC:
@@ -322,13 +335,14 @@ func ServeTunnel(
 	})
 
 	errGroup.Go(func() error {
-		select {
-		case <-reconnectCh:
-			return fmt.Errorf("received disconnect signal")
-		case <-serveCtx.Done():
-			return nil
+		for {
+			select {
+			case reconnect := <-reconnectCh:
+				return &reconnect
+			case <-serveCtx.Done():
+				return nil
+			}
 		}
-
 	})
 
 	errGroup.Go(func() error {
@@ -362,7 +376,11 @@ func ServeTunnel(
 			logger.WithError(castedErr.cause).Error("Register tunnel error on client side")
 			return err, true
 		case muxerShutdownError:
-			logger.Infof("Muxer shutdown")
+			logger.Info("Muxer shutdown")
+			return err, true
+		case *ReconnectSignal:
+			logger.Warnf("Restarting due to reconnect signal in %d seconds", castedErr.Delay)
+			castedErr.DelayBeforeReconnect()
 			return err, true
 		default:
 			logger.WithError(err).Error("Serve tunnel error")
@@ -504,6 +522,8 @@ func UnregisterTunnel(muxer *h2mux.Muxer, gracePeriod time.Duration, logger *log
 		// RPC stream open error
 		return err
 	}
+	defer tunnelServer.Close()
+
 	// gracePeriod is encoded in int64 using capnproto
 	return tunnelServer.UnregisterTunnel(ctx, gracePeriod.Nanoseconds())
 }
@@ -596,7 +616,7 @@ func (h *TunnelHandler) ServeStream(stream *h2mux.MuxedStream) error {
 
 	req, reqErr := h.createRequest(stream)
 	if reqErr != nil {
-		h.logError(stream, reqErr)
+		h.writeErrorResponse(stream, reqErr)
 		return reqErr
 	}
 
@@ -612,7 +632,7 @@ func (h *TunnelHandler) ServeStream(stream *h2mux.MuxedStream) error {
 		resp, respErr = h.serveHTTP(stream, req)
 	}
 	if respErr != nil {
-		h.logError(stream, respErr)
+		h.writeErrorResponse(stream, respErr)
 		return respErr
 	}
 	h.logResponseOk(resp, cfRay, lbProbe)
@@ -650,6 +670,7 @@ func (h *TunnelHandler) serveWebsocket(stream *h2mux.MuxedStream, req *http.Requ
 	// Copy to/from stream to the undelying connection. Use the underlying
 	// connection because cloudflared doesn't operate on the message themselves
 	websocket.Stream(conn.UnderlyingConn(), stream)
+
 	return response, nil
 }
 
@@ -677,7 +698,9 @@ func (h *TunnelHandler) serveHTTP(stream *h2mux.MuxedStream, req *http.Request) 
 	}
 	defer response.Body.Close()
 
-	err = stream.WriteHeaders(h2mux.H1ResponseToH2ResponseHeaders(response))
+	headers := h2mux.H1ResponseToH2ResponseHeaders(response)
+	headers = append(headers, h2mux.CreateResponseMetaHeader(h2mux.ResponseMetaHeaderField, h2mux.ResponseSourceOrigin))
+	err = stream.WriteHeaders(headers)
 	if err != nil {
 		return nil, errors.Wrap(err, "Error writing response header")
 	}
@@ -712,9 +735,12 @@ func (h *TunnelHandler) isEventStream(response *http.Response) bool {
 	return false
 }
 
-func (h *TunnelHandler) logError(stream *h2mux.MuxedStream, err error) {
+func (h *TunnelHandler) writeErrorResponse(stream *h2mux.MuxedStream, err error) {
 	h.logger.WithError(err).Error("HTTP request error")
-	stream.WriteHeaders([]h2mux.Header{{Name: ":status", Value: "502"}})
+	stream.WriteHeaders([]h2mux.Header{
+		{Name: ":status", Value: "502"},
+		h2mux.CreateResponseMetaHeader(h2mux.ResponseMetaHeaderField, h2mux.ResponseSourceCloudflared),
+	})
 	stream.Write([]byte("502 Bad Gateway"))
 	h.metrics.incrementResponses(h.connectionID, "502")
 }

@@ -44,7 +44,7 @@ github.com/aws/aws-sdk-go/service/sts
 github.com/aws/aws-sdk-go/service/sts/stsiface
 # github.com/beorn7/perks v1.0.1
 github.com/beorn7/perks/quantile
-# github.com/certifi/gocertifi v0.0.0-20180118203423-deb3ae2ef261
+# github.com/certifi/gocertifi v0.0.0-20200211180108-c7c1fbc02894
 github.com/certifi/gocertifi
 # github.com/cloudflare/brotli-go v0.0.0-20191101163834-d34379f7ff93
 github.com/cloudflare/brotli-go
@@ -52,6 +52,9 @@ github.com/cloudflare/brotli-go/brotli
 github.com/cloudflare/brotli-go/common
 github.com/cloudflare/brotli-go/dec
 github.com/cloudflare/brotli-go/enc
+# github.com/cloudflare/cfssl v0.0.0-20141119014638-2f7f44e802e2
+github.com/cloudflare/cfssl/log
+github.com/cloudflare/cfssl/revoke
 # github.com/cloudflare/golibs v0.0.0-20170913112048-333127dbecfc
 github.com/cloudflare/golibs/lrucache
 # github.com/cloudflare/golz4 v0.0.0-20150217214814-ef862a3cdc58
@@ -103,6 +106,8 @@ github.com/equinox-io/equinox/proto
 github.com/facebookgo/grace/gracenet
 # github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568
 github.com/flynn/go-shlex
+# github.com/fsnotify/fsnotify v1.4.9
+github.com/fsnotify/fsnotify
 # github.com/getsentry/raven-go v0.0.0-20180517221441-ed7bcb39ff10
 github.com/getsentry/raven-go
 # github.com/gliderlabs/ssh v0.0.0-20191009160644-63518b5243e0
@@ -212,7 +217,7 @@ golang.org/x/crypto/poly1305
 golang.org/x/crypto/salsa20/salsa
 golang.org/x/crypto/ssh
 golang.org/x/crypto/ssh/terminal
-# golang.org/x/net v0.0.0-20191007182048-72f939374954
+# golang.org/x/net v0.0.0-20191014212845-da9a3fd4c582
 golang.org/x/net/bpf
 golang.org/x/net/context
 golang.org/x/net/context/ctxhttp
@@ -222,9 +227,11 @@ golang.org/x/net/http2/hpack
 golang.org/x/net/idna
 golang.org/x/net/internal/iana
 golang.org/x/net/internal/socket
+golang.org/x/net/internal/socks
 golang.org/x/net/internal/timeseries
 golang.org/x/net/ipv4
 golang.org/x/net/ipv6
+golang.org/x/net/proxy
 golang.org/x/net/trace
 golang.org/x/net/websocket
 # golang.org/x/oauth2 v0.0.0-20190604053449-0f29369cfe45
@@ -232,7 +239,7 @@ golang.org/x/oauth2
 golang.org/x/oauth2/internal
 # golang.org/x/sync v0.0.0-20190423024810-112230192c58
 golang.org/x/sync/errgroup
-# golang.org/x/sys v0.0.0-20191008105621-543471e840be
+# golang.org/x/sys v0.0.0-20191020212454-3e7259c5e7c2
 golang.org/x/sys/cpu
 golang.org/x/sys/unix
 golang.org/x/sys/windows
@@ -240,7 +247,7 @@ golang.org/x/sys/windows/registry
 golang.org/x/sys/windows/svc
 golang.org/x/sys/windows/svc/eventlog
 golang.org/x/sys/windows/svc/mgr
-# golang.org/x/text v0.3.2
+# golang.org/x/text v0.3.0
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/trace"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/cloudflare/cloudflared/metrics"
 	"github.com/cloudflare/cloudflared/origin"
 	"github.com/cloudflare/cloudflared/signal"
+	"github.com/cloudflare/cloudflared/socks"
 	"github.com/cloudflare/cloudflared/sshlog"
 	"github.com/cloudflare/cloudflared/sshserver"
 	"github.com/cloudflare/cloudflared/supervisor"
@@ -37,6 +39,7 @@ import (
 	"github.com/getsentry/raven-go"
 	"github.com/gliderlabs/ssh"
 	"github.com/google/uuid"
+	"github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	"gopkg.in/urfave/cli.v2"
 	"gopkg.in/urfave/cli.v2/altsrc"
@@ -76,6 +79,9 @@ const (
 
 	// hostKeyPath is the path of the dir to save SSH host keys too
 	hostKeyPath = "host-key-path"
+
+	// socks5Flag is to enable the socks server to deframe
+	socks5Flag = "socks5"
 
 	noIntentMsg = "The --intent argument is required. Cloudflared looks up an Intent to determine what configuration to use (i.e. which tunnels to start). If you don't have any Intents yet, you can use a placeholder Intent Label for now. Then, when you make an Intent with that label, cloudflared will get notified and open the tunnels you specified in that Intent."
 )
@@ -133,6 +139,12 @@ func Commands() []*cli.Command {
 					Usage:   "Upstream endpoint URL, you can specify multiple endpoints for redundancy.",
 					Value:   cli.NewStringSlice("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"),
 					EnvVars: []string{"TUNNEL_DNS_UPSTREAM"},
+				},
+				&cli.StringSliceFlag{
+					Name:    "bootstrap",
+					Usage:   "bootstrap endpoint URL, you can specify multiple endpoints for redundancy.",
+					Value:   cli.NewStringSlice("https://162.159.36.1/dns-query", "https://162.159.46.1/dns-query", "https://[2606:4700:4700::1111]/dns-query", "https://[2606:4700:4700::1001]/dns-query"),
+					EnvVars: []string{"TUNNEL_DNS_BOOTSTRAP"},
 				},
 			},
 			ArgsUsage: " ", // can't be the empty string or we get the default output
@@ -390,7 +402,18 @@ func StartServer(c *cli.Context, version string, shutdownC, graceShutdownC chan 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errC <- websocket.StartProxyServer(logger, listener, host, shutdownC)
+			streamHandler := websocket.DefaultStreamHandler
+			if c.IsSet(socks5Flag) {
+				logger.Info("SOCKS5 server started")
+				streamHandler = func(wsConn *websocket.Conn, remoteConn net.Conn) {
+					dialer := socks.NewConnDialer(remoteConn)
+					requestHandler := socks.NewRequestHandler(dialer)
+					socksServer := socks.NewConnectionHandler(requestHandler)
+
+					socksServer.Serve(wsConn)
+				}
+			}
+			errC <- websocket.StartProxyServer(logger, listener, host, shutdownC, streamHandler)
 		}()
 		c.Set("url", "http://"+listener.Addr().String())
 	}
@@ -400,7 +423,7 @@ func StartServer(c *cli.Context, version string, shutdownC, graceShutdownC chan 
 		return err
 	}
 
-	reconnectCh := make(chan struct{}, 1)
+	reconnectCh := make(chan origin.ReconnectSignal, 1)
 	if c.IsSet("stdin-control") {
 		logger.Warn("Enabling control through stdin")
 		go stdinControl(reconnectCh)
@@ -411,7 +434,6 @@ func StartServer(c *cli.Context, version string, shutdownC, graceShutdownC chan 
 		defer wg.Done()
 		errC <- origin.StartTunnelDaemon(ctx, tunnelConfig, connectedSignal, cloudflaredID, reconnectCh)
 	}()
-
 	return waitToShutdown(&wg, errC, shutdownC, graceShutdownC, c.Duration("grace-period"))
 }
 
@@ -585,9 +607,15 @@ func notifySystemd(waitForSignal *signal.Signal) {
 
 func writePidFile(waitForSignal *signal.Signal, pidFile string) {
 	<-waitForSignal.Wait()
-	file, err := os.Create(pidFile)
+	expandedPath, err := homedir.Expand(pidFile)
 	if err != nil {
-		logger.WithError(err).Errorf("Unable to write pid to %s", pidFile)
+		logger.WithError(err).Errorf("Unable to expand %s, try to use absolute path in --pidfile", pidFile)
+		return
+	}
+	file, err := os.Create(expandedPath)
+	if err != nil {
+		logger.WithError(err).Errorf("Unable to write pid to %s", expandedPath)
+		return
 	}
 	defer file.Close()
 	fmt.Fprintf(file, "%d", os.Getpid())
@@ -948,6 +976,13 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			EnvVars: []string{"TUNNEL_DNS_UPSTREAM"},
 			Hidden:  shouldHide,
 		}),
+		altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
+			Name:    "proxy-dns-bootstrap",
+			Usage:   "bootstrap endpoint URL, you can specify multiple endpoints for redundancy.",
+			Value:   cli.NewStringSlice("https://162.159.36.1/dns-query", "https://162.159.46.1/dns-query", "https://[2606:4700:4700::1111]/dns-query", "https://[2606:4700:4700::1001]/dns-query"),
+			EnvVars: []string{"TUNNEL_DNS_BOOTSTRAP"},
+			Hidden:  shouldHide,
+		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
 			Name:    "grace-period",
 			Usage:   "Duration to accept new requests after cloudflared receives first SIGINT/SIGTERM. A second SIGINT/SIGTERM will force cloudflared to shutdown immediately.",
@@ -1074,20 +1109,44 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Hidden:  true,
 			Value:   false,
 		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    socks5Flag,
+			Usage:   "specify if this tunnel is running as a SOCK5 Server",
+			EnvVars: []string{"TUNNEL_SOCKS"},
+			Value:   false,
+			Hidden:  false,
+		}),
 	}
 }
 
-func stdinControl(reconnectCh chan struct{}) {
+func stdinControl(reconnectCh chan origin.ReconnectSignal) {
 	for {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			command := scanner.Text()
+			parts := strings.SplitN(command, " ", 2)
 
-			switch command {
+			switch parts[0] {
+			case "":
+				break
 			case "reconnect":
-				reconnectCh <- struct{}{}
+				var reconnect origin.ReconnectSignal
+				if len(parts) > 1 {
+					var err error
+					if reconnect.Delay, err = time.ParseDuration(parts[1]); err != nil {
+						logger.Error(err.Error())
+						continue
+					}
+				}
+				logger.Infof("Sending reconnect signal %+v", reconnect)
+				reconnectCh <- reconnect
 			default:
 				logger.Warn("Unknown command: ", command)
+				fallthrough
+			case "help":
+				logger.Info(`Supported command: 
+reconnect [delay] 
+- restarts one randomly chosen connection with optional delay before reconnect`)
 			}
 		}
 	}
